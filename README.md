@@ -8,6 +8,8 @@
 [![Platform](https://img.shields.io/badge/OpenWrt-21.02%2B-blue.svg)](https://openwrt.org)
 [![LuCI](https://img.shields.io/badge/LuCI-JS%20view-orange.svg)](https://github.com/openwrt/luci)
 
+> 主仓库在 [Gitee](https://gitee.com/heycrr/hey_ruijielogin_auth)，GitHub 为镜像。安装包请以 Gitee Releases 为准。
+
 ---
 
 ## 为什么需要它
