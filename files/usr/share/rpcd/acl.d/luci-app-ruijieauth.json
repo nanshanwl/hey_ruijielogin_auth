@@ -1,0 +1,28 @@
+{
+	"luci-app-ruijieauth": {
+		"description": "Grant access to ruijieauth control",
+		"read": {
+			"file": {
+				"/usr/sbin/ruijieauth": [ "exec" ],
+				"/usr/sbin/ruijieauth *": [ "exec" ],
+				"/etc/init.d/ruijieauth": [ "exec" ],
+				"/etc/init.d/ruijieauth *": [ "exec" ]
+			},
+			"ubus": {
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/ruijieauth": [ "exec" ],
+				"/usr/sbin/ruijieauth *": [ "exec" ],
+				"/etc/init.d/ruijieauth": [ "exec" ],
+				"/etc/init.d/ruijieauth *": [ "exec" ]
+			},
+			"ubus": {
+				"service": [ "list", "delete", "restart" ]
+			},
+			"uci": [ "ruijieauth" ]
+		}
+	}
+}

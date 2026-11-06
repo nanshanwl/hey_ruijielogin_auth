@@ -1,0 +1,13 @@
+{
+	"admin/services/ruijieauth": {
+		"title": "锐捷认证",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "ruijieauth/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-ruijieauth" ]
+		}
+	}
+}

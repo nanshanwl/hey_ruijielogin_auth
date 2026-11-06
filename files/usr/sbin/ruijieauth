@@ -1,0 +1,1100 @@
+#!/bin/sh
+# ruijieauth - 锐捷 ePortal 校园网自动认证 / 会话保活 / 掉线自愈（通用版）
+#
+# 设计目标: 不写死任何学校的地址与参数。
+#   1) 能自动识别的, 用 detect 自动填 (多数锐捷 ePortal 可以)
+#   2) 识别不了的, 用 import-curl 把浏览器里"复制为 cURL"的那条请求粘进来, 自动拆分
+#
+# 快速开始:
+#   ruijieauth detect --write        # 处于"未认证"状态时运行
+#   ruijieauth set-auth 账号 密码
+#   ruijieauth -v login              # 先手工验证一次
+#   /etc/init.d/ruijieauth enable && /etc/init.d/ruijieauth start
+#
+# 子命令:
+#   status [-j]          状态 ( -j 输出 key=value 给 LuCI )
+#   probe                网络与认证跳转诊断
+#   detect [--write]     自动识别 portal, 加 --write 直接写入配置
+#   setup                交互式向导 ( detect + 账号 + 试登录 + 启动 )
+#   import-curl <文件>   从浏览器复制的 cURL 命令里提取配置
+#   check                探测一次, 掉线则认证 (守护进程内部也用它)
+#   login [-v]           立即认证
+#   logout               退出认证
+#   reauth [-v]          退出并重新认证 (主动换会话)
+#   daemon               前台守护 (由 init.d 拉起)
+#   doctor               自检: 依赖/配置/连通性
+#   set-auth <账号> <密码>
+#   set-portal <键> <值>
+#   log [行数]
+#   version
+
+. /lib/functions.sh
+
+VERSION="1.0.0"
+
+LAST_FILE="/etc/ruijieauth.last"
+RESP_FILE="/var/run/ruijieauth.resp"
+REDIR_FILE="/var/run/ruijieauth.redirect"
+BODY_FILE="/var/run/ruijieauth.body"
+COOKIE_FILE="/var/run/ruijieauth.cookies"
+REAUTH_ATTEMPT_FILE="/var/run/ruijieauth.reauth_attempt"
+DETECT_FILE="/var/run/ruijieauth.detect"
+LOG_TAG="ruijieauth"
+VERBOSE=0
+
+log() {
+	logger -t "$LOG_TAG" "$*" 2>/dev/null
+	[ "$VERBOSE" = "1" ] && echo "[$(date '+%F %T')] $*"
+	return 0
+}
+
+err() {
+	logger -t "$LOG_TAG" -p user.err "$*" 2>/dev/null
+	echo "错误: $*" >&2
+	return 0
+}
+
+warn() {
+	logger -t "$LOG_TAG" -p user.warn "$*" 2>/dev/null
+	echo "注意: $*" >&2
+	return 0
+}
+
+strip0() {
+	local v
+	v="${1#0}"
+	[ -z "$v" ] && v=0
+	echo "$v"
+}
+
+# 把值转义成可以安全放进 sed 替换段的形式 (& | \)
+esc_sed() {
+	printf '%s' "$1" | sed -e 's/[&\\|]/\\&/g'
+}
+
+# ---------- 配置 ----------
+
+load_config() {
+	config_load ruijieauth 2>/dev/null
+
+	config_get_bool ENABLED         main enabled 1
+	config_get      IFACE           main iface "wan"
+	config_get      USERNAME        main username ""
+	config_get      PASSWORD        main password ""
+	config_get      UA              main ua "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+	config_get      CHECK_URLS      main check_urls "http://connect.rom.miui.com/generate_204 https://www.baidu.com"
+	config_get      PROBE_URLS      main probe_urls "http://connect.rom.miui.com/generate_204 http://www.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://1.1.1.1 http://www.baidu.com"
+	config_get      CHECK_INTERVAL  main check_interval 60
+	config_get_bool REAUTH_ENABLE   main reauth_enable 1
+	config_get      REAUTH_DAYS     main reauth_days 6
+	config_get      REAUTH_WINDOW   main reauth_window "04:00-05:00"
+	config_get      MAX_BACKOFF     main max_backoff 600
+	config_get      EXPIRY_DAYS     main expiry_days 7
+	config_get      FAST_INTERVAL   main fast_interval 10
+
+	config_get      BASE            portal base ""
+	config_get      PRE_URL         portal pre_url ""
+	config_get      LOGIN_URL       portal login_url ""
+	config_get      LOGIN_METHOD    portal login_method "POST"
+	config_get      LOGIN_FIELDS    portal login_fields ""
+	config_get      LOGIN_BODY      portal login_body ""
+	config_get      SUCCESS_GREP    portal success_grep '"result":"success"'
+	config_get      LOGOUT_URL      portal logout_url ""
+	config_get      QUERYSTRING     portal query_string ""
+	config_get      REFERER         portal referer ""
+	config_get      PASSWORD_ENCRYPT portal password_encrypt "auto"
+	config_get      SERVICE         portal service ""
+
+	[ -n "$CHECK_INTERVAL" ] || CHECK_INTERVAL=60
+	[ -n "$REAUTH_DAYS" ]    || REAUTH_DAYS=6
+	[ -n "$MAX_BACKOFF" ]    || MAX_BACKOFF=600
+	[ -n "$PASSWORD_ENCRYPT" ] || PASSWORD_ENCRYPT="auto"
+	if [ -z "$LOGIN_FIELDS" ] && [ -z "$LOGIN_BODY" ]; then
+		LOGIN_FIELDS='userId=@USERNAME@&password=@PASSWORD@&service=@SERVICE@&queryString=@QUERYSTRING@&operatorPwd=&operatorUserId=&validcode=&passwordEncrypt=false'
+	fi
+}
+
+# ---------- 小工具 ----------
+
+url_host() {
+	printf '%s' "$1" | sed -n 's|^\(https\?://[^/]*\).*|\1|p'
+}
+
+base_of() {
+	local h
+	h=$(url_host "$1")
+	[ -n "$h" ] && echo "$h"
+}
+
+# %XX 解码 (纯 awk, 不依赖外部工具)
+urldecode() {
+	printf '%s' "$1" | awk '
+	function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+	{
+		out = ""; n = length($0)
+		for (i = 1; i <= n; i++) {
+			c = substr($0, i, 1)
+			if (c == "%" && i + 2 <= n) {
+				h = hexval(substr($0, i + 1, 1)) * 16 + hexval(substr($0, i + 2, 1))
+				if (h >= 0 && h < 256) { out = out sprintf("%c", h); i += 2 }
+				else out = out c
+			} else if (c == "+") out = out " "
+			else out = out c
+		}
+		printf "%s", out
+	}'
+}
+
+# cURL 公共参数 (写到 stdout, 供 eval 拼装)
+curl_opts() {
+	printf '%s' "-s -m ${1:-10} -A \"$(esc_sed "$UA")\""
+}
+
+# ---------- 连通性 ----------
+
+check_online() {
+	local url code
+	for url in $CHECK_URLS; do
+		code=$(curl -s -o /dev/null -m 6 -A "$UA" -w '%{http_code}' "$url" 2>/dev/null)
+		case "$code" in
+			204)
+				return 0
+				;;
+			200)
+				case "$url" in
+					*generate_204*) : ;;
+					*) return 0 ;;
+				esac
+				;;
+		esac
+	done
+	return 1
+}
+
+# ---------- 自动识别 ----------
+
+# 从 URL 里截出 wlanuserip=... 这一段
+qs_from_url() {
+	local u q
+	u="$1"
+	case "$u" in
+		*wlanuserip=*)
+			q="wlanuserip=${u#*wlanuserip=}"
+			# 去掉尾部的 # 锚点和 HTML 实体
+			q="${q%%#*}"
+			printf '%s' "$q" | sed -e 's/&amp;/\&/g'
+			return 0
+			;;
+	esac
+	return 1
+}
+
+# 从页面正文里找跳转 URL 或直接找参数
+qs_from_body() {
+	local bf q u
+	bf="$1"
+	[ -s "$bf" ] || return 1
+
+	# 1) 正文里的完整 ePortal 跳转 URL
+	u=$(grep -o "https\?://[0-9A-Za-z._:/-]*eportal/[^'\"<> ]*" "$bf" 2>/dev/null | head -1)
+	if [ -n "$u" ]; then
+		u=$(printf '%s' "$u" | sed -e 's/&amp;/\&/g')
+		q=$(qs_from_url "$u")
+		if [ -n "$q" ]; then
+			# 函数可能跑在 $(...) 子 shell 里, 所以把地址落到文件, 由调用者读
+			printf '%s' "$u" > "$DETECT_FILE"
+			printf '%s' "$q"
+			return 0
+		fi
+	fi
+
+	# 2) 正文里直接出现 wlanuserip= (常见于 <script> 拼跳转)
+	q=$(grep -o "wlanuserip=[^'\"<> ]*" "$bf" 2>/dev/null | head -1)
+	if [ -n "$q" ]; then
+		printf '%s' "$q" | sed -e 's/&amp;/\&/g'
+		return 0
+	fi
+	return 1
+}
+
+# 探测未认证时的劫持/跳转, 成功则设置:
+#   PORTAL_URL  触发跳转的完整地址
+#   PORTAL_QS   queryString
+find_portal() {
+	local u url i out code loc qs body
+	PORTAL_URL=""
+	PORTAL_QS=""
+	rm -f "$DETECT_FILE" 2>/dev/null
+
+	for u in $PROBE_URLS; do
+		url="$u"
+		i=0
+		while [ "$i" -lt 4 ]; do
+			out=$(curl -s -m 6 -A "$UA" -o "$BODY_FILE" -w '%{http_code} %{redirect_url}' "$url" 2>/dev/null)
+			case "$out" in
+				*" "*) code="${out%% *}"; loc="${out#* }" ;;
+				*)     code="$out"; loc="" ;;
+			esac
+
+			if [ -n "$loc" ]; then
+				qs=$(qs_from_url "$loc")
+				if [ -n "$qs" ]; then
+					PORTAL_URL="$loc"
+					PORTAL_QS="$qs"
+					return 0
+				fi
+			fi
+
+			qs=$(qs_from_body "$BODY_FILE")
+			if [ -n "$qs" ]; then
+				if [ -s "$DETECT_FILE" ]; then
+					PORTAL_URL=$(cat "$DETECT_FILE")
+				else
+					PORTAL_URL="$url"
+				fi
+				PORTAL_QS="$qs"
+				return 0
+			fi
+
+			[ -n "$loc" ] || break
+			url="$loc"
+			i=$((i + 1))
+		done
+	done
+	return 1
+}
+
+# 兼容旧名字
+fetch_query_string() {
+	find_portal || return 1
+	printf '%s' "$PORTAL_QS"
+}
+
+# 从 portal 的 pageInfo 接口读公钥/服务名, 结果放进 PK_MODULUS / PK_EXPONENT / SERVICE
+ensure_pubkey() {
+	local b resp u
+	[ -n "$PK_MODULUS" ] && return 0
+	b="$BASE"
+	[ -n "$b" ] || b=$(base_of "$LOGIN_URL")
+	[ -n "$b" ] || return 1
+
+	u="$b/eportal/InterFace.do?method=pageInfo"
+	resp=$(curl -s -m 10 -A "$UA" -c "$COOKIE_FILE" -b "$COOKIE_FILE" "$u" 2>/dev/null)
+	case "$resp" in
+		*publicKeyModulus*) : ;;
+		*)
+			# 有的版本要 POST + queryString
+			resp=$(curl -s -m 10 -A "$UA" -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
+				--data-urlencode "queryString=$QUERYSTRING" \
+				"$u" 2>/dev/null)
+			;;
+	esac
+	[ -n "$resp" ] || return 1
+	PK_MODULUS=$(printf '%s' "$resp" | sed -n 's/.*"publicKeyModulus":"\([^"]*\)".*/\1/p' | head -1)
+	PK_EXPONENT=$(printf '%s' "$resp" | sed -n 's/.*"publicKeyExponent":"\([^"]*\)".*/\1/p' | head -1)
+	if [ -z "$SERVICE" ]; then
+		SERVICE=$(printf '%s' "$resp" | sed -n 's/.*"service":"\([^"]*\)".*/\1/p' | head -1)
+	fi
+	[ -n "$PK_MODULUS" ]
+}
+
+# RSA 加密密码 (锐捷 passwordEncrypt=true 的实现: c = m^e mod n, 输出十六进制)
+# 依赖 bc:  opkg install bc
+rsa_encrypt() {
+	local n e hex out
+	n="$PK_MODULUS"
+	e="$PK_EXPONENT"
+	[ -n "$n" ] || return 1
+	[ -n "$e" ] || e="10001"
+	command -v bc >/dev/null 2>&1 || { err "该校启用 RSA 加密, 请先 opkg install bc"; return 1; }
+
+	hex=$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n')
+	[ -n "$hex" ] || return 1
+
+	out=$(
+		{
+			echo "ibase=16"
+			echo "n=$n"
+			echo "e=$e"
+			echo "m=$hex"
+			echo "ibase=A"
+			echo "r=1"
+			echo "while (e > 0) {"
+			echo "  if (e % 2 == 1) r = (r * m) % n"
+			echo "  e = e / 2"
+			echo "  m = (m * m) % n"
+			echo "}"
+			echo "obase=16"
+			echo "r"
+		} | bc 2>/dev/null
+	)
+	out=$(printf '%s' "$out" | tr -d ' \n' | tr 'A-F' 'a-f')
+	[ -n "$out" ] || return 1
+	printf '%s' "$out"
+}
+
+# 用识别结果拼出各项地址
+derive_from_portal() {
+	local qs
+	qs="$PORTAL_QS"
+	D_BASE=$(base_of "$PORTAL_URL")
+	[ -n "$D_BASE" ] || return 1
+	D_QS="$qs"
+	D_LOGIN="$D_BASE/eportal/InterFace.do?method=login"
+	D_LOGOUT="$D_BASE/eportal/InterFace.do?method=logout&userIndex=@USERINDEX@"
+	D_PRE="$D_BASE/eportal/index.jsp?@QUERYSTRING@"
+	D_REFERER="$D_BASE/eportal/index.jsp?@QUERYSTRING@"
+	return 0
+}
+
+cmd_detect() {
+	local write=0 probe_ok=0
+
+	case "$1" in
+		--write|-w) write=1 ;;
+	esac
+
+	if check_online; then
+		warn "当前处于在线状态, portal 一般不会再返回跳转地址"
+		warn "要自动识别, 请先在浏览器里退出认证, 或等被踢下线后再运行"
+	fi
+
+	echo "正在探测未认证跳转 ..."
+	if find_portal; then
+		probe_ok=1
+	elif [ -n "$QUERYSTRING" ]; then
+		warn "没能从跳转里取到 queryString, 使用配置里已有的一串"
+		PORTAL_URL="$BASE/eportal/index.jsp?$QUERYSTRING"
+		PORTAL_QS="$QUERYSTRING"
+		probe_ok=1
+	fi
+
+	if [ "$probe_ok" = "0" ]; then
+		err "自动识别失败: 没有发现认证跳转"
+		echo "  1) 确认当前是未认证状态 (能上内网, 上不了外网)"
+		echo "  2) 用浏览器打开任意 http 网站, 看跳转到哪个地址"
+		echo "  3) 仍不行就用: ruijieauth import-curl /tmp/login.curl"
+		return 1
+	fi
+
+	derive_from_portal || { err "无法从跳转地址推导 portal 地址"; return 1; }
+
+	# 探一下 pageInfo, 顺便拿公钥和 service
+	BASE="$D_BASE"
+	QUERYSTRING="$D_QS"
+	PK_MODULUS=""; PK_EXPONENT=""
+	if ensure_pubkey; then
+		D_ENCRYPT="rsa"
+	else
+		D_ENCRYPT="none"
+	fi
+	[ -n "$SERVICE" ] || SERVICE=""
+
+	local tail
+	tail=$(printf '%s' "$D_QS" | tail -c 13)
+
+	echo
+	echo "识别结果"
+	echo "  portal 地址 : $D_BASE/eportal/index.jsp"
+	echo "  跳转来源    : $PORTAL_URL"
+	echo "  登录接口    : $D_LOGIN"
+	echo "  注销接口    : $D_LOGOUT"
+	echo "  queryString : ${tail}  (共 ${#D_QS} 字符)"
+	if [ "$D_ENCRYPT" = "rsa" ]; then
+		echo "  密码加密    : RSA (公钥 ${#PK_MODULUS} 位十六进制)"
+		echo "                需要 opkg install bc"
+	else
+		echo "  密码加密    : 明文 (passwordEncrypt=false)"
+	fi
+	[ -n "$SERVICE" ] && echo "  service     : $SERVICE"
+
+	if [ "$write" = "1" ]; then
+		uci set ruijieauth.portal.base="$D_BASE"
+		uci set ruijieauth.portal.login_url="$D_LOGIN"
+		uci set ruijieauth.portal.logout_url="$D_LOGOUT"
+		uci set ruijieauth.portal.pre_url="$D_PRE"
+		uci set ruijieauth.portal.referer="$D_REFERER"
+		uci set ruijieauth.portal.query_string="$D_QS"
+		uci set ruijieauth.portal.password_encrypt="$D_ENCRYPT"
+		[ -n "$SERVICE" ] && uci set ruijieauth.portal.service="$SERVICE"
+		uci commit ruijieauth
+		echo
+		echo "已写入 /etc/config/ruijieauth"
+	else
+		echo
+		echo "未写入配置; 确认无误后加 --write 重跑:  ruijieauth detect --write"
+	fi
+	return 0
+}
+
+# ---------- 从 cURL 导入 ----------
+
+cmd_import_curl() {
+	local f url body method hdr
+
+	f="$1"
+	[ -n "$f" ] || { echo "用法: ruijieauth import-curl <文件>"; echo "先在浏览器 DevTools 里对登录请求右键 -> Copy as cURL, 粘贴到文件里"; return 1; }
+	[ -s "$f" ] || { err "文件不存在或为空: $f"; return 1; }
+
+	# 允许跨行粘贴: 去掉 \r 和换行, 压成一行再解析
+	raw=$(tr -d '\r' < "$f" | tr '\n' ' ')
+	url=$(printf '%s' "$raw" | grep -o "https\?://[^'\" ]*" | head -1)
+	[ -n "$url" ] || { err "没找到 URL"; return 1; }
+
+	body=$(printf '%s' "$raw" | sed -n "s/.*--data-raw '\([^']*\)'.*/\1/p" | head -1)
+	[ -n "$body" ] || body=$(printf '%s' "$raw" | sed -n 's/.*--data-raw "\([^"]*\)".*/\1/p' | head -1)
+	[ -n "$body" ] || body=$(printf '%s' "$raw" | sed -n "s/.*--data '\([^']*\)'.*/\1/p" | head -1)
+	[ -n "$body" ] || body=$(printf '%s' "$raw" | sed -n 's/.*--data "\([^"]*\)".*/\1/p' | head -1)
+	[ -n "$body" ] || body=$(printf '%s' "$raw" | sed -n "s/.*[[:space:]]-d '\([^']*\)'.*/\1/p" | head -1)
+	[ -n "$body" ] || body=$(printf '%s' "$raw" | sed -n 's/.*[[:space:]]-d "\([^"]*\)".*/\1/p' | head -1)
+
+	if [ -n "$body" ]; then method="POST"; else method="GET"; fi
+	printf '%s' "$raw" | grep -qE -- '(-X|--request) GET' && method="GET"
+
+	hdr=$(tr -d '\r' < "$f" | grep -o -i "user-agent: [^'\"]*" | head -1 | sed 's/^[^:]*: //')
+	[ -n "$hdr" ] && UA="$hdr"
+
+	echo "解析结果"
+	echo "  URL    : $url"
+	echo "  方法   : $method"
+	echo "  表单长度: ${#body}"
+
+	if [ -z "$body" ]; then
+		warn "没解析到请求体, 只有 URL; 适合 GET 型 portal"
+	fi
+
+	local qs_enc qs fields f2 k v vv
+	fields=""
+	set -- $(printf '%s' "$body" | tr '&' ' ')
+	for f2 in "$@"; do
+		k="${f2%%=*}"
+		v="${f2#*=}"
+		vv="$v"
+		case "$k" in
+			userId|username|account) vv="@USERNAME@" ;;
+			password|pwd)            vv="@PASSWORD@" ;;
+			queryString)             vv="@QUERYSTRING@" ;;
+			service)                 vv="@SERVICE@" ;;
+			passwordEncrypt)         vv="false" ;;
+		esac
+		[ -n "$fields" ] && fields="$fields&"
+		fields="$fields$k=$vv"
+
+		case "$k" in
+			queryString) qs_enc="$v" ;;
+		esac
+	done
+
+	if [ -n "$qs_enc" ]; then
+		qs=$(urldecode "$(urldecode "$qs_enc")")
+		echo "  queryString: 长度 ${#qs}, 尾号 $(printf '%s' "$qs" | tail -c 13)"
+	fi
+
+	# 推导 base / 注销 / 预请求
+	D_BASE=$(base_of "$url")
+	D_LOGIN="$url"
+	D_LOGOUT=$(printf '%s' "$url" | sed 's/method=login/method=logout\&userIndex=@USERINDEX@/')
+	if [ "$D_LOGOUT" = "$url" ]; then
+		D_LOGOUT="$D_BASE/eportal/InterFace.do?method=logout&userIndex=@USERINDEX@"
+	fi
+	D_PRE="$D_BASE/eportal/index.jsp?@QUERYSTRING@"
+	D_REFERER="$D_PRE"
+
+	echo
+	echo "即将写入:"
+	echo "  login_url  = $D_LOGIN"
+	echo "  logout_url = $D_LOGOUT"
+	echo "  base       = $D_BASE"
+
+	uci set ruijieauth.portal.base="$D_BASE"
+	uci set ruijieauth.portal.login_url="$D_LOGIN"
+	uci set ruijieauth.portal.logout_url="$D_LOGOUT"
+	uci set ruijieauth.portal.pre_url="$D_PRE"
+	uci set ruijieauth.portal.referer="$D_REFERER"
+	uci set ruijieauth.portal.login_method="$method"
+	[ -n "$fields" ] && uci set ruijieauth.portal.login_fields="$fields"
+	[ -n "$qs" ] && uci set ruijieauth.portal.query_string="$qs"
+	uci commit ruijieauth
+
+	echo
+	echo "已写入 /etc/config/ruijieauth"
+	echo "下一步: 设置账号  ruijieauth set-auth 账号 密码"
+	echo "       然后试登录 ruijieauth -v login"
+	return 0
+}
+
+# ---------- 认证 ----------
+
+do_pre() {
+	local u
+	[ -n "$PRE_URL" ] || return 0
+	u=$(printf '%s' "$PRE_URL" | sed -e "s|@QUERYSTRING@|$(esc_sed "$1")|g")
+	curl -s -o /dev/null -m 10 -A "$UA" -c "$COOKIE_FILE" -b "$COOKIE_FILE" "$u" 2>/dev/null
+	return 0
+}
+
+# $1=queryString  $2=none|rsa
+do_login_once() {
+	local qs mode pw body rc f k v
+	qs="$1"
+	mode="$2"
+	pw="$PASSWORD"
+
+	if [ "$mode" = "rsa" ]; then
+		ensure_pubkey || { err "portal 声称需要 RSA, 但没取到公钥"; return 1; }
+		pw=$(rsa_encrypt "$PASSWORD") || return 1
+	fi
+
+	do_pre "$qs"
+
+	set -- -s -m 15 -A "$UA" -c "$COOKIE_FILE" -b "$COOKIE_FILE"
+	[ -n "$REFERER" ] && set -- "$@" -e "$(printf '%s' "$REFERER" | sed -e "s|@QUERYSTRING@|$(esc_sed "$qs")|g")"
+	[ "$LOGIN_METHOD" = "GET" ] && set -- "$@" -G
+
+	if [ -n "$LOGIN_FIELDS" ]; then
+		for f in $(printf '%s' "$LOGIN_FIELDS" | tr '&' ' '); do
+			k="${f%%=*}"
+			v="${f#*=}"
+			case "$k" in
+				passwordEncrypt)
+					if [ "$mode" = "rsa" ]; then v="true"; else v="false"; fi
+					set -- "$@" --data-urlencode "$k=$v"
+					continue
+					;;
+			esac
+			case "$v" in
+				"@USERNAME@")    set -- "$@" --data-urlencode "$k=$USERNAME" ;;
+				"@PASSWORD@")    set -- "$@" --data-urlencode "$k=$pw" ;;
+				"@QUERYSTRING@") set -- "$@" --data-urlencode "$k=$qs" ;;
+				"@SERVICE@")     set -- "$@" --data-urlencode "$k=$SERVICE" ;;
+				"@UA@")          set -- "$@" --data-urlencode "$k=$UA" ;;
+				*)               set -- "$@" --data-urlencode "$k=$v" ;;
+			esac
+		done
+	elif [ -n "$LOGIN_BODY" ]; then
+		body=$(printf '%s' "$LOGIN_BODY" | sed -e "s|@USERNAME@|$USERNAME|g" -e "s|@PASSWORD@|$pw|g" -e "s|@QUERYSTRING@|$qs|g")
+		set -- "$@" --data "$body"
+	fi
+
+	curl "$@" "$LOGIN_URL" -o "$RESP_FILE" -w '%{redirect_url}' > "$REDIR_FILE" 2>/dev/null
+	rc=$?
+
+	if [ "$VERBOSE" = "1" ]; then
+		echo "--- 请求: $LOGIN_METHOD $LOGIN_URL  (密码方式: $mode)"
+		echo "--- 响应 (前 600 字节) ---"
+		head -c 600 "$RESP_FILE" 2>/dev/null
+		echo
+	fi
+
+	sleep 2
+	if check_online; then
+		date +%s > "$LAST_FILE"
+		log "认证成功"
+		return 0
+	fi
+
+	if [ -n "$SUCCESS_GREP" ] && grep -qiE "$SUCCESS_GREP" "$RESP_FILE" 2>/dev/null; then
+		sleep 3
+		if check_online; then
+			date +%s > "$LAST_FILE"
+			log "认证成功 (延迟生效)"
+			return 0
+		fi
+	fi
+
+	log "认证失败 (curl=$rc): $(head -c 300 "$RESP_FILE" 2>/dev/null | tr -d '\r\n' | cut -c1-300)"
+	return 1
+}
+
+do_login() {
+	local qs fresh mode
+
+	[ -n "$USERNAME" ] || { err "未配置账号, 先执行 ruijieauth set-auth <账号> <密码>"; return 1; }
+	[ -n "$LOGIN_URL" ] || { err "未配置 portal.login_url, 先执行 ruijieauth detect --write"; return 1; }
+
+	qs="$QUERYSTRING"
+	if [ -z "$qs" ]; then
+		qs=$(fetch_query_string 2>/dev/null)
+		[ -n "$qs" ] && log "自动获取 queryString 成功"
+	fi
+	[ -n "$qs" ] || log "警告: 没拿到 queryString, 部分 portal 会拒绝认证"
+
+	mode="none"
+	[ "$PASSWORD_ENCRYPT" = "rsa" ] && mode="rsa"
+	[ "$mode" = "rsa" ] && { ensure_pubkey || { err "配置要求 RSA, 但没取到公钥 (可能已在线)"; return 1; }; }
+
+	do_login_once "$qs" "$mode" && return 0
+
+	# auto: 明文不行就换 RSA 再试一次
+	if [ "$PASSWORD_ENCRYPT" = "auto" ] && [ "$mode" = "none" ]; then
+		if command -v bc >/dev/null 2>&1 && ensure_pubkey 2>/dev/null; then
+			log "明文认证失败, 改用 RSA 加密重试"
+			do_login_once "$qs" "rsa" && return 0
+		fi
+	fi
+
+	# 配置里的 queryString 可能已随 WAN IP 变化失效, 现场重新取一次
+	fresh=$(fetch_query_string 2>/dev/null)
+	if [ -n "$fresh" ] && [ "$fresh" != "$qs" ]; then
+		log "换用现场获取的 queryString 重试"
+		do_login_once "$fresh" "$mode" && return 0
+	fi
+
+	case "$(cat "$RESP_FILE" 2>/dev/null)" in
+		*设备未注册*|*未注册*)
+			log "提示: queryString 与当前 WAN IP/MAC 不匹配, 重新运行 ruijieauth detect --write 覆盖"
+			;;
+		*验证码*|*validcode*)
+			log "提示: portal 要求验证码, 自动认证已暂停; 请先在浏览器里成功登录一次"
+			;;
+	esac
+	return 1
+}
+
+do_logout() {
+	local url ui info_url
+	[ -n "$LOGOUT_URL" ] || return 0
+
+	ui=$(sed -n 's/.*"userIndex":"\([^"]*\)".*/\1/p' "$RESP_FILE" 2>/dev/null | head -1)
+	[ -n "$ui" ] || ui=$(sed -n 's/.*[?&]userIndex=\([0-9A-Za-z]*\).*/\1/p' "$REDIR_FILE" 2>/dev/null | head -1)
+	if [ -z "$ui" ] && [ -n "$LOGIN_URL" ]; then
+		info_url=$(printf '%s' "$LOGIN_URL" | sed -e 's/method=login/method=getOnlineUserInfo/')
+		ui=$(curl -s -m 10 -A "$UA" -b "$COOKIE_FILE" -c "$COOKIE_FILE" "$info_url" 2>/dev/null \
+			| sed -n 's/.*"userIndex":"\([^"]*\)".*/\1/p' | head -1)
+	fi
+	[ -n "$ui" ] || log "警告: 没找到 userIndex, 注销可能失败"
+
+	url=$(printf '%s' "$LOGOUT_URL" \
+		| sed -e "s|@USERNAME@|$(esc_sed "$USERNAME")|g" \
+		      -e "s|@USERINDEX@|$(esc_sed "$ui")|g" \
+		      -e "s|@QUERYSTRING@|$(esc_sed "$QUERYSTRING")|g")
+	curl -s -o /dev/null -m 10 -A "$UA" -b "$COOKIE_FILE" -c "$COOKIE_FILE" "$url" 2>/dev/null
+	log "已发送注销请求 (userIndex=${ui:-空})"
+	sleep 1
+	return 0
+}
+
+do_reauth() {
+	local i
+	log "主动重连: 先退出再登录"
+	do_logout
+
+	i=0
+	while [ "$i" -lt 8 ]; do
+		check_online || break
+		sleep 1
+		i=$((i + 1))
+	done
+	if check_online; then
+		log "注销未生效 (仍然在线), 本次主动重连放弃, 避免误判成功"
+		return 1
+	fi
+
+	sleep 1
+	if do_login; then
+		date +%s > "$REAUTH_ATTEMPT_FILE"
+		return 0
+	fi
+	log "主动重连失败, 交给看门狗继续重试"
+	return 1
+}
+
+# ---------- 主动重连判断 ----------
+
+hm_to_min() {
+	local h m
+	h="${1%%:*}"
+	m="${1#*:}"
+	[ "$m" = "$1" ] && m=0
+	h=$(strip0 "$h")
+	m=$(strip0 "$m")
+	echo $((h * 60 + m))
+}
+
+in_window() {
+	local w s e ns ne now
+	w="$REAUTH_WINDOW"
+	[ -n "$w" ] || return 0
+	case "$w" in
+		*-*) s="${w%-*}"; e="${w#*-}" ;;
+		*)   s="$w"; e="$w" ;;
+	esac
+	ns=$(hm_to_min "$s")
+	ne=$(hm_to_min "$e")
+	now=$(( $(strip0 "$(date +%H)") * 60 + $(strip0 "$(date +%M)") ))
+	if [ "$ns" -le "$ne" ]; then
+		[ "$now" -ge "$ns" ] && [ "$now" -le "$ne" ]
+	else
+		[ "$now" -ge "$ns" ] || [ "$now" -le "$ne" ]
+	fi
+}
+
+reauth_due() {
+	local last now due_at
+	[ "$REAUTH_ENABLE" = "1" ] || return 1
+	last=$(cat "$LAST_FILE" 2>/dev/null)
+	[ -n "$last" ] || return 1
+	now=$(date +%s)
+	due_at=$((last + REAUTH_DAYS * 86400))
+	[ "$now" -ge "$due_at" ] || return 1
+	in_window
+}
+
+maybe_reauth() {
+	local now last_try last age
+	reauth_due || return 0
+	now=$(date +%s)
+	last_try=$(cat "$REAUTH_ATTEMPT_FILE" 2>/dev/null)
+	[ -n "$last_try" ] || last_try=0
+	[ $((now - last_try)) -ge 1800 ] || return 0
+	echo "$now" > "$REAUTH_ATTEMPT_FILE"
+	last=$(cat "$LAST_FILE" 2>/dev/null)
+	age=0
+	[ -n "$last" ] && age=$(( (now - last) / 3600 ))
+	log "登录已 ${age} 小时, 在时间窗内, 执行主动重连"
+	do_reauth
+}
+
+next_sleep() {
+	local last due now d
+	d="$CHECK_INTERVAL"
+	if [ "${EXPIRY_DAYS:-0}" -gt 0 ] && [ "${FAST_INTERVAL:-0}" -gt 0 ]; then
+		last=$(cat "$LAST_FILE" 2>/dev/null)
+		if [ -n "$last" ]; then
+			due=$((last + EXPIRY_DAYS * 86400))
+			now=$(date +%s)
+			if [ $((now - due)) -ge -600 ] && [ $((now - due)) -le 1800 ]; then
+				d="$FAST_INTERVAL"
+			fi
+		fi
+	fi
+	echo "$d"
+}
+
+# ---------- 子命令 ----------
+
+sync_last() {
+	[ -s "$LAST_FILE" ] && return 0
+	date +%s > "$LAST_FILE"
+	log "上次认证时间缺失, 按当前时间补记"
+}
+
+cmd_check() {
+	if check_online; then
+		[ "$VERBOSE" = "1" ] && echo "在线"
+		sync_last
+		maybe_reauth
+		return 0
+	fi
+	log "探测到断网, 尝试认证"
+	do_login
+}
+
+nap() {
+	sleep "$1" &
+	wait $!
+}
+
+cmd_daemon() {
+	local fails backoff
+	command -v curl >/dev/null 2>&1 || { err "缺少 curl, 请先执行 opkg install curl"; exit 1; }
+	trap 'log "守护进程退出"; exit 0' TERM INT
+	log "守护进程启动 (探测间隔 ${CHECK_INTERVAL}s, 主动重连 ${REAUTH_DAYS} 天)"
+	fails=0
+	while :; do
+		if [ "$ENABLED" != "1" ]; then
+			nap 60
+			continue
+		fi
+		if check_online; then
+			fails=0
+			sync_last
+			maybe_reauth
+			nap "$(next_sleep)"
+			continue
+		fi
+
+		if [ -z "$LOGIN_URL" ]; then
+			log "portal.login_url 未配置, 无法自动认证, 10 分钟后再检查 (先跑 ruijieauth detect --write)"
+			nap 600
+			continue
+		fi
+
+		log "掉线, 尝试认证 (第 $((fails + 1)) 次)"
+		if do_login; then
+			fails=0
+			nap "$CHECK_INTERVAL"
+			continue
+		fi
+
+		fails=$((fails + 1))
+		backoff=$((CHECK_INTERVAL * fails))
+		[ "$backoff" -gt "$MAX_BACKOFF" ] && backoff=$MAX_BACKOFF
+		if [ "$fails" -ge 5 ]; then
+			backoff=3600
+			log "连续失败 ${fails} 次, 暂停 1 小时, 避免触发验证码或锁号, 请检查账号密码"
+		fi
+		log "认证失败, ${backoff}s 后重试"
+		nap "$backoff"
+	done
+}
+
+cmd_status() {
+	local online last now age days last_str next_str next
+	if check_online; then online="在线"; else online="离线"; fi
+
+	last=$(cat "$LAST_FILE" 2>/dev/null)
+	now=$(date +%s)
+	if [ -n "$last" ]; then
+		age=$((now - last))
+		days=$((age / 86400))
+		last_str="$(date -d "@$last" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$last") (${days} 天前)"
+		next=$((last + REAUTH_DAYS * 86400))
+		next_str="$(date -d "@$next" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$next")"
+	else
+		last_str="未知 (从未成功认证过)"
+		next_str="未知"
+	fi
+
+	echo "版本:        ${VERSION}"
+	echo "配置:        enabled=${ENABLED}  接口=${IFACE}  账号=${USERNAME:-未配置}"
+	echo "portal:      ${LOGIN_URL:-未配置}"
+	echo "网络:        ${online}"
+	echo "上次认证:    ${last_str}"
+	echo "下次主动重连: ${next_str}  (窗口 ${REAUTH_WINDOW}, 每 ${REAUTH_DAYS} 天)"
+	if [ -f "$RESP_FILE" ]; then
+		echo "最近响应:    $(head -c 120 "$RESP_FILE" 2>/dev/null | tr -d '\r\n')"
+	fi
+}
+
+cmd_status_json() {
+	local online=0 daemon=0 dev="" ip="" mac="" last="" now next="" qs="" qtail=""
+
+	check_online && online=1
+	pgrep -f 'ruijieauth daemon' >/dev/null 2>&1 && daemon=1
+
+	dev=$(uci -q get "network.$IFACE.device")
+	[ -n "$dev" ] || dev=$(uci -q get "network.$IFACE.ifname")
+	if [ -n "$dev" ]; then
+		ip=$(ip -4 addr show dev "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+		mac=$(ip link show dev "$dev" 2>/dev/null | sed -n 's/.*link\/ether \([0-9a-fA-F:]*\).*/\1/p' | head -1)
+	fi
+
+	last=$(cat "$LAST_FILE" 2>/dev/null)
+	now=$(date +%s)
+	[ -n "$last" ] && next=$((last + REAUTH_DAYS * 86400))
+
+	qs="$QUERYSTRING"
+	[ -n "$qs" ] && qtail=$(printf '%s' "$qs" | tail -c 13)
+
+	echo "version=$VERSION"
+	echo "online=$online"
+	echo "daemon=$daemon"
+	echo "enabled=$ENABLED"
+	echo "wan_dev=$dev"
+	echo "wan_ip=$ip"
+	echo "wan_mac=$mac"
+	echo "username=$USERNAME"
+	echo "last_auth=$last"
+	echo "now=$now"
+	echo "next_reauth=$next"
+	echo "reauth_days=$REAUTH_DAYS"
+	echo "reauth_window=$REAUTH_WINDOW"
+	echo "expiry_days=$EXPIRY_DAYS"
+	echo "interval=$CHECK_INTERVAL"
+	echo "fast_interval=$FAST_INTERVAL"
+	echo "portal=$LOGIN_URL"
+	echo "encrypt=$PASSWORD_ENCRYPT"
+	echo "service=$SERVICE"
+	if [ -n "$qs" ]; then echo "query_string_set=1"; else echo "query_string_set=0"; fi
+	echo "query_string_tail=$qtail"
+	return 0
+}
+
+cmd_probe() {
+	local dev
+	echo "========== ruijieauth 诊断 =========="
+	echo "时间: $(date '+%F %T %Z')  版本: $VERSION"
+
+	dev=$(uci -q get "network.$IFACE.device")
+	[ -n "$dev" ] || dev=$(uci -q get "network.$IFACE.ifname")
+	echo
+	echo "--- 接口 ($IFACE: ${dev:-未知}) ---"
+	[ -n "$dev" ] && ip -4 addr show dev "$dev" 2>/dev/null | grep -E 'inet |link/ether'
+	echo
+	echo "--- 默认路由 ---"
+	ip route 2>/dev/null | head -5
+	echo
+	echo "--- DNS ---"
+	head -5 /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null
+	echo
+	echo "--- 连通性探测 ---"
+	for url in $CHECK_URLS; do
+		printf '  %-50s ' "$url"
+		curl -s -o /dev/null -m 8 -A "$UA" -w '%{http_code}\n' "$url" 2>/dev/null || echo "失败"
+	done
+	echo
+	echo "--- 未认证跳转 ---"
+	if find_portal; then
+		echo "  portal : $PORTAL_URL"
+		echo "  qs 尾号: $(printf '%s' "$PORTAL_QS" | tail -c 13)  (共 ${#PORTAL_QS} 字符)"
+	else
+		echo "  (没有发现跳转; 若当前已在线, 这是正常的)"
+	fi
+	echo
+	echo "--- 相关进程 ---"
+	ps 2>/dev/null | grep -E '[u]a2f|[r]uijieauth' || echo "  (无)"
+	echo "===================================="
+}
+
+cmd_doctor() {
+	local ok=1
+	echo "== 依赖 =="
+	if command -v curl >/dev/null 2>&1; then echo "  [ok] curl"; else echo "  [缺] curl  -> opkg install curl"; ok=0; fi
+	if command -v bc >/dev/null 2>&1; then echo "  [ok] bc"; else echo "  [可选] bc (仅 RSA 学校需要) -> opkg install bc"; fi
+	if command -v uci >/dev/null 2>&1; then echo "  [ok] uci"; else echo "  [缺] uci (不是 OpenWrt?)"; ok=0; fi
+
+	echo
+	echo "== 配置 =="
+	[ -n "$USERNAME" ] && echo "  [ok] 账号 $USERNAME" || { echo "  [缺] 账号 -> ruijieauth set-auth"; ok=0; }
+	[ -n "$LOGIN_URL" ] && echo "  [ok] 登录接口 $LOGIN_URL" || { echo "  [缺] 登录接口 -> ruijieauth detect --write"; ok=0; }
+	[ -n "$QUERYSTRING" ] && echo "  [ok] queryString (尾号 $(printf '%s' "$QUERYSTRING" | tail -c 13))" || echo "  [空] queryString (登录时尝试现场获取)"
+	echo "  [i]  密码方式 $PASSWORD_ENCRYPT"
+
+	echo
+	echo "== 网络 =="
+	if check_online; then echo "  [ok] 当前在线"; else echo "  [i] 当前离线"; fi
+
+	[ "$ok" = "1" ] && echo
+	return 0
+}
+
+cmd_log() {
+	logread -e ruijieauth 2>/dev/null | tail -n "${1:-60}"
+}
+
+cmd_set_auth() {
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		echo "用法: ruijieauth set-auth <账号> <密码>"
+		return 1
+	fi
+	uci set ruijieauth.main.username="$1"
+	uci set ruijieauth.main.password="$2"
+	uci commit ruijieauth
+	echo "已保存到 /etc/config/ruijieauth"
+}
+
+cmd_set_portal() {
+	local k v
+	[ $# -ge 2 ] || { echo "用法: ruijieauth set-portal <键> <值>"; return 1; }
+	k="$1"
+	shift
+	v="$*"
+	case "$k" in
+		base|login_url|logout_url|query_string|pre_url|referer|login_method|login_fields|password_encrypt|service) ;;
+		*) echo "不支持的键: $k"; return 1 ;;
+	esac
+	uci set "ruijieauth.portal.$k=$v"
+	uci commit ruijieauth
+	echo "已保存 portal.$k"
+}
+
+cmd_setup() {
+	local u p ans
+	echo "================ ruijieauth 初始化 ================"
+	echo "当前用户: $(uci -q get ruijieauth.portal.base 2>/dev/null || echo 未配置)"
+	echo
+	echo "第一步: 识别 portal"
+	echo "  需要处于未认证状态 (能打开内网, 打不开外网)."
+	printf "  现在开始识别? [Y/n] "
+	read -r ans
+	case "$ans" in
+		n|N) : ;;
+		*) cmd_detect --write ;;
+	esac
+	load_config
+	echo
+	echo "第二步: 账号密码"
+	printf "  账号: "
+	read -r u
+	printf "  密码: "
+	stty -echo 2>/dev/null
+	read -r p
+	stty echo 2>/dev/null
+	echo
+	[ -n "$u" ] && [ -n "$p" ] && cmd_set_auth "$u" "$p"
+	load_config
+	echo
+	echo "第三步: 试登录"
+	do_login && echo "  登录成功" || echo "  登录失败, 看上面的响应"
+	echo
+	printf "现在启动守护进程并开机自启? [Y/n] "
+	read -r ans
+	case "$ans" in
+		n|N) : ;;
+		*)
+			/etc/init.d/ruijieauth enable 2>/dev/null
+			/etc/init.d/ruijieauth start 2>/dev/null
+			echo "  已启动. 检查: ruijieauth status"
+			;;
+	esac
+	echo "=================================================="
+}
+
+usage() {
+	cat <<EOF
+ruijieauth $VERSION - 锐捷 ePortal 校园网自动认证
+
+用法: ruijieauth [-v] <命令>
+
+  detect [--write]   自动识别 portal 并 (可选) 写入配置
+  setup              交互式向导
+  import-curl <文件> 从浏览器复制的 cURL 提取配置
+  doctor             自检依赖与配置
+  status [-j]        查看状态
+  probe              诊断网络与认证跳转
+  check              探测一次, 掉线则认证
+  login              立即认证 (-v 显示响应)
+  logout             退出认证
+  reauth             退出并重新认证 (-v 显示响应)
+  daemon             前台守护 (由 init.d 拉起, 不要手动常驻)
+  set-auth           设置账号密码
+  set-portal         修改 portal 参数
+  log [行数]         查看日志
+  version            版本号
+EOF
+}
+
+# ---------- 入口 ----------
+
+[ "$1" = "-v" ] && { VERBOSE=1; shift; }
+CMD="$1"
+[ $# -gt 0 ] && shift
+if [ "$1" = "-v" ]; then
+	VERBOSE=1
+	shift
+fi
+
+load_config
+
+case "$CMD" in
+	status)
+		if [ "$1" = "-j" ]; then cmd_status_json; else cmd_status; fi
+		;;
+	probe)      cmd_probe ;;
+	detect)     cmd_detect "$@" ;;
+	setup)      cmd_setup ;;
+	import-curl) cmd_import_curl "$@" ;;
+	doctor)     cmd_doctor ;;
+	check)      cmd_check ;;
+	login)      do_login ;;
+	logout)     do_logout ;;
+	reauth)     do_reauth ;;
+	daemon)     cmd_daemon ;;
+	set-auth)   cmd_set_auth "$@" ;;
+	set-portal) cmd_set_portal "$@" ;;
+	log)        cmd_log "$@" ;;
+	version)    echo "ruijieauth $VERSION" ;;
+	"")         usage ;;
+	*)          usage; exit 1 ;;
+esac

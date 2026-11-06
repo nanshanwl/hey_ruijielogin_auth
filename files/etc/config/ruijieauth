@@ -1,0 +1,63 @@
+# ruijieauth - 锐捷 ePortal 校园网自动认证（通用版）
+#
+# 大部分情况不用手工改这个文件:
+#   ruijieauth detect --write     自动识别 portal 并填好 [portal] 段
+#   ruijieauth set-auth 账号 密码  写入账号
+#   ruijieauth import-curl 文件    识别失败时从浏览器抓包导入
+#
+# 改完执行: /etc/init.d/ruijieauth restart
+
+config ruijieauth 'main'
+	# 总开关
+	option enabled '1'
+	# 出口接口 (单 WAN 一般是 wan)
+	option iface 'wan'
+	# 账号密码: 用 ruijieauth set-auth 写入, 不要手改
+	option username ''
+	option password ''
+	# 请求 UA: 如果同时用 ua2f 做 UA 伪装, 这里要和 ua2f 的 custom_ua 完全一致
+	option ua 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+	# 在线判定: 第一个返回 204 的认为在线
+	option check_urls 'http://connect.rom.miui.com/generate_204 https://www.baidu.com'
+	# 识别 portal 时依次尝试的探测地址 (可加自己学校的)
+	option probe_urls 'http://connect.rom.miui.com/generate_204 http://www.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://1.1.1.1 http://www.baidu.com'
+	# 掉线探测间隔 (秒)
+	option check_interval '60'
+	# 主动重连: 距上次认证满 N 天, 在时间窗内 logout + login 换会话
+	option reauth_enable '1'
+	option reauth_days '6'
+	option reauth_window '04:00-05:00'
+	# 认证失败最大退避 (秒)
+	option max_backoff '600'
+	# 预估被踢周期: 到期前后改用 fast_interval 探测, 掉线后几秒内重登
+	option expiry_days '7'
+	option fast_interval '10'
+
+config portal 'portal'
+	# portal 根地址, 如 http://10.9.9.1   (detect 自动填)
+	option base ''
+	# 认证前 GET 一次, 用于拿 JSESSIONID 等 Cookie
+	option pre_url ''
+	# 认证接口
+	option login_url ''
+	# GET 或 POST
+	option login_method 'POST'
+	# 表单字段, 用 & 或空格分隔. 占位符:
+	#   @USERNAME@  @PASSWORD@  @QUERYSTRING@  @SERVICE@  @UA@
+	# passwordEncrypt 字段由程序按加密方式自动填 true/false
+	option login_fields 'userId=@USERNAME@&password=@PASSWORD@&service=@SERVICE@&queryString=@QUERYSTRING@&operatorPwd=&operatorUserId=&validcode=&passwordEncrypt=false'
+	# 非表单的原始 body (优先级低于 login_fields)
+	option login_body ''
+	# 登录响应里出现这个就认为 portal 说成功 (最终仍以能否上外网为准)
+	option success_grep '"result":"success"'
+	# 注销接口, 支持 @USERNAME@ @USERINDEX@ @QUERYSTRING@
+	option logout_url ''
+	# 加密后的 IP/MAC 参数. detect 能取到就填, 取不到时用 import-curl 导入
+	option query_string ''
+	# 认证请求 Referer
+	option referer ''
+	# 密码加密方式: auto(先明文, 失败再试 RSA) / none / rsa
+	# auto 需要安装 bc:  opkg install bc
+	option password_encrypt 'auto'
+	# 随请求提交的 service 字段 (部分学校要求填 SSID), 留空则用默认值
+	option service ''

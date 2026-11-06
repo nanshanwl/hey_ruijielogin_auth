@@ -1,0 +1,6 @@
+#!/bin/sh
+# WAN 口 up 之后等 5 秒, 主动认证一次
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$INTERFACE" = "wan" ] || exit 0
+sleep 5
+/usr/sbin/ruijieauth check >/dev/null 2>&1 &

@@ -1,0 +1,15 @@
+# 发行包不提交，放到 GitHub Releases
+*.tar.gz
+*.tar
+*.ipk
+*.apk
+
+# 安装脚本产生的备份
+*.bak
+*.orig
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
