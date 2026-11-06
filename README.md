@@ -86,7 +86,7 @@ sh install.sh
 
 ---
 
-## 三步配置
+## 配置步骤：
 
 ### 1. 识别 portal
 
@@ -147,10 +147,10 @@ ruijieauth set-portal login_url   'http://10.9.9.1/eportal/InterFace.do?method=l
 ruijieauth set-portal logout_url  'http://10.9.9.1/eportal/InterFace.do?method=logout&userIndex=@USERINDEX@'
 ```
 
-### B. 直接喂 cURL (最省事)
+### B. 直接喂 cURL 
 
 1. 浏览器打开认证页, F12 → Network
-2. 手动登录一次, 找到那条 `login` 请求
+2. 手动登录一次, 找到 `login` 请求
 3. 右键 → **Copy as cURL**
 4. 粘贴到路由器上的文件:
 
@@ -163,7 +163,7 @@ cat > /tmp/login.curl
 
 ```sh
 ruijieauth import-curl /tmp/login.curl
-ruijieauth set-auth 学号 密码
+ruijieauth set-auth 校园网账号 密码
 ```
 
 导入时会自动把账号和密码字段替换成占位符, 所以抓包里是加密密码也没关系。
@@ -278,11 +278,6 @@ ruijieauth set-auth 学号 密码
 `detect` 会显示「密码加密: RSA」。此时需要 `opkg install bc`, 并把 `portal.password_encrypt` 设成 `rsa`。`auto` 模式会先发明文, 失败再自动换 RSA。
 </details>
 
-<details>
-<summary><b>装了 ua2f, 会被识别成多设备吗</b></summary>
-
-ua2f 只改转发流量的 UA, 路由器自己发的请求不走它。所以 `main.ua` 必须和 ua2f 的 `custom_ua` **完全一致**, 否则 portal 会看到两种 UA。
-</details>
 
 <details>
 <summary><b>能不能只保活, 不主动重连</b></summary>
